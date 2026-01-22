@@ -1,10 +1,26 @@
 # app.py
-import re
+# Streamlit app: Convert multiple "éditions de journaux" Excel (xls/xlsx) into a single FEC text file
+# - Supports multiple uploaded files, different journals and periods
+# - Detects header area automatically
+# - Builds FEC lines and concatenates into one output
+# - Adds per-piece and global debit/credit controls
+#
+# Requirements:
+#   streamlit, pandas, openpyxl, xlrd
+# Recommended (Streamlit Cloud): runtime.txt -> python-3.11
+
 import io
+import re
 from datetime import date
+from typing import Dict, List, Optional, Tuple
+
 import pandas as pd
 import streamlit as st
 
+
+# -----------------------------
+# FEC columns (standard order)
+# -----------------------------
 FEC_COLUMNS = [
     "JournalCode", "JournalLib", "EcritureNum", "EcritureDate",
     "CompteNum", "CompteLib", "CompAuxNum", "CompAuxLib",
@@ -14,21 +30,34 @@ FEC_COLUMNS = [
     "Montantdevise", "Idevise"
 ]
 
-def to_decimal_fr(x):
-    """Convertit '1 002,00' / '556,80' / 556.80 / NaN -> float (ou 0)."""
-    if x is None or (isinstance(x, float) and pd.isna(x)):
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def normalize_space(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
+def to_decimal_fr(x) -> float:
+    """Convert '1 002,00' / '556,80' / 556.80 / NaN -> float (or 0)."""
+    if x is None:
+        return 0.0
+    if isinstance(x, float) and pd.isna(x):
         return 0.0
     if isinstance(x, (int, float)):
         return float(x)
+
     s = str(x).strip()
     if s == "" or s.lower() == "nan":
         return 0.0
-    # retire espaces milliers
+
+    # remove NBSP and spaces (thousands)
     s = s.replace("\u00A0", " ").replace(" ", "")
-    # virgule décimale -> point
+    # comma decimal -> dot
     s = s.replace(",", ".")
-    # garde uniquement chiffres/point/signe
+    # keep digits / dot / minus
     s = re.sub(r"[^0-9\.\-]", "", s)
+
     if s in ("", "-", ".", "-."):
         return 0.0
     try:
@@ -36,198 +65,216 @@ def to_decimal_fr(x):
     except ValueError:
         return 0.0
 
-def find_period_and_journal(df_raw: pd.DataFrame):
+
+def excel_engine_for_filename(name: str) -> str:
+    name = (name or "").lower()
+    if name.endswith(".xls"):
+        return "xlrd"
+    return "openpyxl"
+
+
+def safe_str_cell(x) -> str:
+    if x is None:
+        return ""
+    if isinstance(x, float) and pd.isna(x):
+        return ""
+    s = str(x)
+    if s.lower() == "nan":
+        return ""
+    return s
+
+
+def extract_compte_num(v: str) -> str:
+    """Handle 'C 30020' or '30020' or ' 30020 ' -> '30020'."""
+    s = normalize_space(safe_str_cell(v))
+    s = re.sub(r"^\s*C\s+", "", s, flags=re.IGNORECASE)
+    m = re.search(r"([0-9]{3,})", s)
+    return m.group(1) if m else s
+
+
+def detect_period_journal(df_raw: pd.DataFrame) -> Tuple[str, str, str]:
     """
-    Tente de détecter :
-      - JournalCode (ex: 001)
-      - JournalLib (ex: Ventes et prestations)
-      - Période (mois/année) ex: 12/2025
-    en scannant les cellules texte.
+    Try to detect:
+      - JournalCode (e.g., 001)
+      - JournalLib (e.g., Ventes et prestations)
+      - Period (e.g., 12/2025)
+    by scanning top rows.
     """
     journal_code = ""
     journal_lib = ""
     period = ""
 
-    # concat lignes en texte
-    for r in range(min(len(df_raw), 80)):
-        row = df_raw.iloc[r].astype(str).fillna("").tolist()
-        line = " ".join([c for c in row if c and c.lower() != "nan"])
-        line = re.sub(r"\s+", " ", line).strip()
+    max_scan = min(len(df_raw), 120)
+    for r in range(max_scan):
+        row = [safe_str_cell(c) for c in df_raw.iloc[r].tolist()]
+        line = normalize_space(" ".join([c for c in row if c]))
 
-        # Période
         if not period:
             m = re.search(r"\bP[ée]riode\b\s*([0-1]?\d\/20\d{2})", line, flags=re.IGNORECASE)
             if m:
                 period = m.group(1)
 
-        # Journal
         if ("Journal" in line or "JOURNAL" in line) and not journal_code:
-            # Ex: "Journal 001 Ventes et prestations"
+            # ex: "Journal 001 Ventes et prestations"
             m = re.search(r"\bJournal\b\s*([0-9]{1,3})\s+(.+)$", line, flags=re.IGNORECASE)
             if m:
                 journal_code = m.group(1).zfill(3)
-                journal_lib = m.group(2).strip()
-        # Autre forme : "001 Ventes et prestations"
+                journal_lib = normalize_space(m.group(2))
+
+        # fallback: "001 Ventes et prestations"
         if not journal_code:
             m = re.search(r"\b([0-9]{3})\b\s+([A-Za-zÀ-ÿ].+)", line)
-            if m and "Folio" not in line:
+            if m and "Folio" not in line and "Période" not in line and "/" not in m.group(2):
                 journal_code = m.group(1)
-                # évite de prendre des choses type "12/2025"
-                if "/" not in m.group(2):
-                    journal_lib = m.group(2).strip()
+                journal_lib = normalize_space(m.group(2))
 
     return journal_code, journal_lib, period
 
-def find_header_row(df_raw: pd.DataFrame):
+
+def find_header_row(df_raw: pd.DataFrame) -> Optional[int]:
     """
-    Cherche la ligne d'entête contenant au moins Ecr / Jour / Pièce / Compte / Débit / Crédit.
-    Retourne l'index de ligne.
+    Find header row containing most of:
+      Ecr / Jour / Pièce / Compte / Débit / Crédit
     """
     required = ["ecr", "jour", "pi", "comp", "dé", "cr"]
-    for r in range(min(len(df_raw), 200)):
-        row = df_raw.iloc[r].astype(str).fillna("").str.lower().tolist()
+    max_scan = min(len(df_raw), 250)
+    for r in range(max_scan):
+        row = [safe_str_cell(c).lower() for c in df_raw.iloc[r].tolist()]
         joined = " ".join(row)
         score = sum(1 for k in required if k in joined)
         if score >= 5:
             return r
     return None
 
-def normalize_headers(header_row):
-    """
-    Normalise les noms de colonnes.
-    """
-    headers = []
-    for h in header_row:
-        s = str(h).strip()
-        s = re.sub(r"\s+", " ", s)
-        headers.append(s)
-    return headers
 
-def parse_table(df_raw: pd.DataFrame):
-    journal_code, journal_lib, period = find_period_and_journal(df_raw)
+def pick_col(columns: List[str], patterns: List[str], fallback_contains: Optional[str] = None) -> Optional[str]:
+    for p in patterns:
+        for c in columns:
+            if re.search(p, c, flags=re.IGNORECASE):
+                return c
+    if fallback_contains:
+        for c in columns:
+            if fallback_contains.lower() in c.lower():
+                return c
+    return None
+
+
+def parse_period_to_year_month(period: str) -> Tuple[int, int]:
+    """
+    period format: '12/2025'
+    """
+    m = re.match(r"^\s*([0-1]?\d)\s*/\s*(20\d{2})\s*$", period or "")
+    if not m:
+        raise ValueError(f"Période introuvable ou au mauvais format (attendu 'MM/YYYY') : '{period}'")
+    mois = int(m.group(1))
+    annee = int(m.group(2))
+    if not (1 <= mois <= 12):
+        raise ValueError(f"Mois invalide dans la période : {period}")
+    return annee, mois
+
+
+def coerce_day(jour_cell: str) -> int:
+    s = safe_str_cell(jour_cell).strip()
+    s = re.sub(r"\D", "", s)
+    if s == "":
+        return 1
+    try:
+        d = int(s)
+        if 1 <= d <= 31:
+            return d
+    except Exception:
+        pass
+    return 1
+
+
+def detect_sheets(xls: pd.ExcelFile) -> List[str]:
+    # Keep all sheets, user can choose to parse all or select some
+    return list(xls.sheet_names)
+
+
+def parse_one_sheet_to_fec(
+    df_raw: pd.DataFrame,
+    file_name: str,
+    sheet_name: str,
+    default_journal_code: str = "001",
+    default_journal_lib: str = "Journal",
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """
+    Parse one raw sheet (header=None) into a FEC dataframe.
+    """
+    journal_code, journal_lib, period = detect_period_journal(df_raw)
+    journal_code = journal_code or default_journal_code
+    journal_lib = journal_lib or default_journal_lib
+
     header_idx = find_header_row(df_raw)
     if header_idx is None:
-        raise ValueError("Impossible de trouver la ligne d'entête (Ecr/Jour/Pièce/Compte/Débit/Crédit).")
+        raise ValueError(f"[{file_name} / {sheet_name}] Impossible de trouver l'entête du tableau (Ecr/Jour/Pièce/Compte/Débit/Crédit).")
 
-    headers = normalize_headers(df_raw.iloc[header_idx].tolist())
+    headers = [normalize_space(safe_str_cell(c)) for c in df_raw.iloc[header_idx].tolist()]
     data = df_raw.iloc[header_idx + 1:].copy()
     data.columns = headers
-
-    # supprime lignes vides
     data = data.dropna(how="all")
-    # enlève les lignes où aucune info "Pièce" ou "Compte" n'apparait
-    # (la colonne peut s'appeler "Pièce" ou "Piece" suivant export)
-    possible_piece_cols = [c for c in data.columns if re.search(r"pi[eè]ce", c, flags=re.IGNORECASE)]
-    possible_compte_cols = [c for c in data.columns if re.search(r"compte", c, flags=re.IGNORECASE)]
-    if not possible_piece_cols or not possible_compte_cols:
-        raise ValueError("Colonnes 'Pièce' ou 'Compte' introuvables après lecture.")
 
-    piece_col = possible_piece_cols[0]
-    compte_col = possible_compte_cols[0]
+    cols = list(data.columns)
 
-    # détecte colonnes Débit / Crédit
-    debit_cols = [c for c in data.columns if re.search(r"d[ée]bit", c, flags=re.IGNORECASE)]
-    credit_cols = [c for c in data.columns if re.search(r"cr[ée]dit", c, flags=re.IGNORECASE)]
-    if not debit_cols or not credit_cols:
-        raise ValueError("Colonnes 'Débit' et/ou 'Crédit' introuvables.")
+    # core columns
+    col_ecr = pick_col(cols, [r"^Ecr\.?$", r"\bEcr\b"], fallback_contains="Ecr")
+    col_jour = pick_col(cols, [r"\bJour\b"])
+    col_piece = pick_col(cols, [r"Pi[eè]ce"])
+    col_compte = pick_col(cols, [r"\bCompte\b"])
+    col_debit = pick_col(cols, [r"D[ée]bit"])
+    col_credit = pick_col(cols, [r"Cr[ée]dit"])
 
-    debit_col = debit_cols[0]
-    credit_col = credit_cols[0]
+    if not all([col_ecr, col_jour, col_piece, col_compte, col_debit, col_credit]):
+        missing = [n for n, v in [
+            ("Ecr", col_ecr), ("Jour", col_jour), ("Pièce", col_piece),
+            ("Compte", col_compte), ("Débit", col_debit), ("Crédit", col_credit)
+        ] if not v]
+        raise ValueError(f"[{file_name} / {sheet_name}] Colonnes manquantes: {', '.join(missing)}")
 
-    # Colonnes Ecr / Jour
-    ecr_cols = [c for c in data.columns if re.fullmatch(r"Ecr\.?|Ecr", c, flags=re.IGNORECASE)]
-    if not ecr_cols:
-        # fallback : contient "Ecr"
-        ecr_cols = [c for c in data.columns if "ecr" in c.lower()]
-    if not ecr_cols:
-        raise ValueError("Colonne 'Ecr.' introuvable.")
-    ecr_col = ecr_cols[0]
+    # Libellé écriture
+    col_lib_ecr = pick_col(cols, [r"Libell[ée]\s*[ée]criture", r"\bLibell[ée]\b"], fallback_contains="Libell")
 
-    jour_cols = [c for c in data.columns if re.search(r"\bjour\b", c, flags=re.IGNORECASE)]
-    if not jour_cols:
-        raise ValueError("Colonne 'Jour' introuvable.")
-    jour_col = jour_cols[0]
+    # CompteLib: either explicit column, or guess next to Compte if it looks textual
+    col_compte_lib = None
+    compte_idx = cols.index(col_compte)
+    if compte_idx + 1 < len(cols):
+        candidate = cols[compte_idx + 1]
+        if candidate not in (col_debit, col_credit) and (
+            re.search(r"libell", candidate, flags=re.IGNORECASE)
+            or data[candidate].head(30).astype(str).str.contains(r"[A-Za-zÀ-ÿ]", regex=True).mean() > 0.6
+        ):
+            col_compte_lib = candidate
 
-    # Certaines éditions ont 2 colonnes de libellés :
-    # - une pour le libellé du compte (VENTE PIECE, MO, TVA...)
-    # - une pour le libellé d'écriture (Fact. xxxx - Client ...)
-    # On cherche une colonne "Libellé écriture" / "Libellé"
-    lib_ecr_cols = [c for c in data.columns if re.search(r"libell[ée]\s*[ée]criture", c, flags=re.IGNORECASE)]
-    lib_cols = [c for c in data.columns if re.fullmatch(r"Libell[ée]\s*", c, flags=re.IGNORECASE) or "libell" in c.lower()]
+    # Period -> year/month
+    annee, mois = parse_period_to_year_month(period)
 
-    lib_ecr_col = lib_ecr_cols[0] if lib_ecr_cols else (lib_cols[-1] if lib_cols else None)
+    # Filter rows that look like movements
+    data[col_piece] = data[col_piece].astype(str).map(lambda x: normalize_space(safe_str_cell(x)))
+    data[col_compte] = data[col_compte].astype(str).map(lambda x: normalize_space(safe_str_cell(x)))
 
-    # Le libellé du compte est parfois dans une colonne entre Compte et Libellé écriture
-    # (comme ton exemple : "Compte" puis "Libellé écriture" mais en fait tu as les 2)
-    # Ici on tente de prendre la colonne juste après "Compte" si elle ressemble à un libellé de compte.
-    compte_idx = list(data.columns).index(compte_col)
-    compte_lib_col = None
-    if compte_idx + 1 < len(data.columns):
-        candidate = data.columns[compte_idx + 1]
-        # si la candidate n'est pas Débit/Crédit et contient souvent des mots (pas des montants)
-        if candidate not in (debit_col, credit_col) and "libell" in candidate.lower():
-            compte_lib_col = candidate
-        else:
-            # parfois la colonne n'est pas nommée "Libellé" mais contient VENTE PIECE/MO/TVA...
-            # on teste sur quelques lignes
-            sample = data[candidate].head(20).astype(str)
-            if candidate not in (debit_col, credit_col) and sample.str.contains(r"[A-Za-zÀ-ÿ]", regex=True).mean() > 0.6:
-                compte_lib_col = candidate
+    data = data[(data[col_piece] != "") & (data[col_compte] != "")]
 
-    # période -> (mois, année)
-    if period:
-        m = re.match(r"^\s*([0-1]?\d)\s*/\s*(20\d{2})\s*$", period)
-        if not m:
-            raise ValueError(f"Période détectée mais format inattendu: {period}")
-        mois = int(m.group(1))
-        annee = int(m.group(2))
-    else:
-        # fallback : on essaie de trouver un "12/2025" dans la page
-        mois, annee = 1, 2000
-
-    # Nettoyage et extraction des comptes : parfois "C 30020" ou colonne séparée
-    def extract_compte_num(v):
-        if v is None or (isinstance(v, float) and pd.isna(v)):
-            return ""
-        s = str(v).strip()
-        s = re.sub(r"\s+", " ", s)
-        # enlève un éventuel indicateur "C"
-        s = re.sub(r"^\s*C\s+", "", s, flags=re.IGNORECASE)
-        # garde les chiffres (compte)
-        m = re.search(r"([0-9]{3,})", s)
-        return m.group(1) if m else s
-
-    # Stopper à la première grande zone vide de mouvements
-    # (si l'édition contient des pages/folios)
-    # On garde les lignes où piece et compte existent.
-    data[piece_col] = data[piece_col].astype(str).str.strip()
-    data[compte_col] = data[compte_col].astype(str).str.strip()
-    data = data[(data[piece_col] != "") & (data[piece_col].str.lower() != "nan") & (data[compte_col] != "")]
-
-    rows = []
+    fec_rows = []
     for _, r in data.iterrows():
-        piece = str(r.get(piece_col, "")).strip()
-        ecr = str(r.get(ecr_col, "")).strip()
-        jour = str(r.get(jour_col, "")).strip()
+        piece = normalize_space(safe_str_cell(r.get(col_piece)))
+        ecr_num = piece or normalize_space(safe_str_cell(r.get(col_ecr)))
+        jour = r.get(col_jour)
+        d = coerce_day(jour)
+        ecr_date = date(annee, mois, d).strftime("%Y%m%d")
 
-        compte_num = extract_compte_num(r.get(compte_col, ""))
-        compte_lib = str(r.get(compte_lib_col, "")).strip() if compte_lib_col else ""
+        compte_num = extract_compte_num(r.get(col_compte))
+        compte_lib = normalize_space(safe_str_cell(r.get(col_compte_lib))) if col_compte_lib else ""
 
-        lib_ecr = str(r.get(lib_ecr_col, "")).strip() if lib_ecr_col else ""
-        debit = to_decimal_fr(r.get(debit_col, 0))
-        credit = to_decimal_fr(r.get(credit_col, 0))
+        lib_ecr = normalize_space(safe_str_cell(r.get(col_lib_ecr))) if col_lib_ecr else ""
 
-        # Date d'écriture : année/mois de période + jour
-        try:
-            d = int(re.sub(r"\D", "", jour)) if jour else 1
-            ecr_date = date(annee, mois, d).strftime("%Y%m%d")
-        except Exception:
-            ecr_date = date(annee, mois, 1).strftime("%Y%m%d")
+        debit = to_decimal_fr(r.get(col_debit))
+        credit = to_decimal_fr(r.get(col_credit))
 
-        fec_row = {
-            "JournalCode": journal_code or "001",
-            "JournalLib": journal_lib or "Ventes",
-            "EcritureNum": piece if piece and piece.lower() != "nan" else (ecr or ""),
+        fec_rows.append({
+            "JournalCode": journal_code,
+            "JournalLib": journal_lib,
+            "EcritureNum": ecr_num,
             "EcritureDate": ecr_date,
             "CompteNum": compte_num,
             "CompteLib": compte_lib,
@@ -242,21 +289,35 @@ def parse_table(df_raw: pd.DataFrame):
             "DateLet": "",
             "ValidDate": "",
             "Montantdevise": "",
-            "Idevise": ""
-        }
-        rows.append(fec_row)
+            "Idevise": "",
+            # internal trace (not exported)
+            "_src_file": file_name,
+            "_src_sheet": sheet_name,
+        })
 
-    fec = pd.DataFrame(rows, columns=FEC_COLUMNS)
+    fec = pd.DataFrame(fec_rows)
 
-    # sécurise formats
-    fec["Debit"] = fec["Debit"].map(lambda x: f"{x:.2f}" if x != "" else "")
-    fec["Credit"] = fec["Credit"].map(lambda x: f"{x:.2f}" if x != "" else "")
+    # Ensure standard columns exist
+    for c in FEC_COLUMNS:
+        if c not in fec.columns:
+            fec[c] = ""
 
-    return fec, {"journal_code": journal_code, "journal_lib": journal_lib, "period": period}
+    # Format debit/credit as 2 decimals (FEC expects numeric; we keep as string with dot)
+    fec["Debit"] = fec["Debit"].map(lambda x: f"{float(x):.2f}" if str(x) != "" else "")
+    fec["Credit"] = fec["Credit"].map(lambda x: f"{float(x):.2f}" if str(x) != "" else "")
+
+    meta = {
+        "JournalCode": journal_code,
+        "JournalLib": journal_lib,
+        "Period": period,
+        "File": file_name,
+        "Sheet": sheet_name,
+        "Rows": str(len(fec)),
+    }
+    return fec[FEC_COLUMNS + ["_src_file", "_src_sheet"]], meta
+
 
 def fec_to_text(df_fec: pd.DataFrame) -> str:
-    # FEC = séparateur |
-    # Valeurs vides -> vide
     out = io.StringIO()
     out.write("|".join(FEC_COLUMNS) + "\n")
     for _, r in df_fec.iterrows():
@@ -269,81 +330,161 @@ def fec_to_text(df_fec: pd.DataFrame) -> str:
         out.write("|".join(vals) + "\n")
     return out.getvalue()
 
-def check_balance(df_fec: pd.DataFrame):
-    # Totaux par pièce + global
-    df = df_fec.copy()
-    df["Debit_num"] = df["Debit"].astype(str).str.replace(",", ".", regex=False).astype(float)
-    df["Credit_num"] = df["Credit"].astype(str).str.replace(",", ".", regex=False).astype(float)
 
-    by_piece = df.groupby("PieceRef", dropna=False).agg(
-        Debit=("Debit_num", "sum"),
-        Credit=("Credit_num", "sum"),
-        Lignes=("PieceRef", "size")
+def add_balance_controls(df_fec: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """
+    Returns per-piece balance and global totals.
+    """
+    df = df_fec.copy()
+
+    # numeric columns
+    df["_debit_num"] = df["Debit"].astype(str).str.replace(",", ".", regex=False).replace("", "0").astype(float)
+    df["_credit_num"] = df["Credit"].astype(str).str.replace(",", ".", regex=False).replace("", "0").astype(float)
+
+    by_piece = df.groupby(
+        ["JournalCode", "PieceRef", "EcritureDate"],
+        dropna=False
+    ).agg(
+        Debit=("_debit_num", "sum"),
+        Credit=("_credit_num", "sum"),
+        Lignes=("PieceRef", "size"),
     ).reset_index()
 
     by_piece["Ecart"] = (by_piece["Debit"] - by_piece["Credit"]).round(2)
 
-    total_debit = float(df["Debit_num"].sum())
-    total_credit = float(df["Credit_num"].sum())
-    total_ecart = round(total_debit - total_credit, 2)
+    totals = {
+        "TotalDebit": float(df["_debit_num"].sum()),
+        "TotalCredit": float(df["_credit_num"].sum()),
+    }
+    totals["TotalEcart"] = round(totals["TotalDebit"] - totals["TotalCredit"], 2)
 
-    return by_piece, total_debit, total_credit, total_ecart
+    # show biggest imbalances first
+    by_piece = by_piece.sort_values("Ecart", key=lambda s: s.abs(), ascending=False)
+
+    return by_piece, totals
 
 
-st.set_page_config(page_title="Convertisseur Éditions de ventes -> FEC", layout="wide")
-st.title("Convertisseur d’éditions de ventes (XLS/XLSX) vers FEC")
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+st.set_page_config(page_title="Multi-fichiers -> FEC", layout="wide")
+st.title("Convertisseur multi-fichiers d’éditions (XLS/XLSX) vers un FEC unique")
 
 st.write(
-    "Charge une édition de ventes (type *Journaux comptables – Ventes et prestations*) "
-    "et télécharge le fichier FEC (texte séparé par `|`)."
+    "Charge **plusieurs fichiers** d’éditions de journaux (périodes et journaux différents possibles). "
+    "L’app produit **un seul fichier FEC** (texte séparé par `|`) et affiche un **contrôle Débit/Crédit**."
 )
 
-uploaded = st.file_uploader("Fichier XLS/XLSX", type=["xls", "xlsx"])
+uploaded_files = st.file_uploader(
+    "Fichiers XLS/XLSX (plusieurs)",
+    type=["xls", "xlsx"],
+    accept_multiple_files=True
+)
 
-if uploaded:
-    # Lecture brute (sans header), toutes cellules
-    xls = pd.ExcelFile(uploaded)
-    sheet = st.selectbox("Feuille à importer", xls.sheet_names, index=0)
+colA, colB, colC = st.columns([1, 1, 2])
+with colA:
+    parse_all_sheets = st.checkbox("Parser toutes les feuilles", value=True)
+with colB:
+    strict_balance = st.checkbox("Bloquer téléchargement si déséquilibre global", value=False)
+with colC:
+    st.caption(
+        "Si tu décoches 'Parser toutes les feuilles', l’app prendra uniquement la 1ère feuille de chaque fichier. "
+        "Pour éviter les surprises, l’option 'bloquer' peut imposer Débit = Crédit global."
+    )
 
-    df_raw = pd.read_excel(xls, sheet_name=sheet, header=None, engine="openpyxl")
+if uploaded_files:
+    fec_parts: List[pd.DataFrame] = []
+    metas: List[Dict[str, str]] = []
+    errors: List[str] = []
 
-    try:
-        fec_df, meta = parse_table(df_raw)
+    with st.spinner("Lecture et conversion des fichiers…"):
+        for uf in uploaded_files:
+            file_name = uf.name
+            engine = excel_engine_for_filename(file_name)
 
-        st.subheader("Détection")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Journal", meta.get("journal_code") or "—")
-        c2.metric("Libellé", meta.get("journal_lib") or "—")
-        c3.metric("Période", meta.get("period") or "—")
+            try:
+                xls = pd.ExcelFile(uf, engine=engine)
+            except Exception as e:
+                errors.append(f"[{file_name}] Impossible d’ouvrir le fichier Excel ({engine}) : {e}")
+                continue
 
-        st.subheader("Aperçu des écritures FEC")
-        st.dataframe(fec_df.head(50), use_container_width=True)
+            sheets = detect_sheets(xls)
+            if not sheets:
+                errors.append(f"[{file_name}] Aucune feuille détectée.")
+                continue
 
-        st.subheader("Contrôle d’équilibre")
-        by_piece, td, tc, te = check_balance(fec_df)
-        st.write(f"Total Débit = **{td:.2f}** ; Total Crédit = **{tc:.2f}** ; Écart = **{te:.2f}**")
-        st.dataframe(by_piece.sort_values("Ecart", key=lambda s: s.abs(), ascending=False).head(30),
-                     use_container_width=True)
+            sheets_to_parse = sheets if parse_all_sheets else [sheets[0]]
 
-        fec_text = fec_to_text(fec_df)
-        default_name = f"FEC_{meta.get('journal_code') or 'JRN'}_{(meta.get('period') or 'PERIODE').replace('/','')}.txt"
+            for sh in sheets_to_parse:
+                try:
+                    df_raw = pd.read_excel(xls, sheet_name=sh, header=None)  # uses xls engine
+                    fec_df, meta = parse_one_sheet_to_fec(
+                        df_raw=df_raw,
+                        file_name=file_name,
+                        sheet_name=sh,
+                        default_journal_code="001",
+                        default_journal_lib="Journal",
+                    )
+                    if len(fec_df) > 0:
+                        fec_parts.append(fec_df)
+                        metas.append(meta)
+                except Exception as e:
+                    # Keep parsing other sheets/files
+                    errors.append(str(e))
 
-        st.download_button(
-            "Télécharger le FEC",
-            data=fec_text.encode("utf-8"),
-            file_name=default_name,
-            mime="text/plain"
+    st.subheader("Résultat de conversion")
+    if metas:
+        st.dataframe(pd.DataFrame(metas), use_container_width=True)
+    else:
+        st.warning("Aucune donnée convertie. Vérifie le format des fichiers (entête du tableau, période, etc.).")
+
+    if errors:
+        with st.expander(f"Erreurs / feuilles ignorées ({len(errors)})"):
+            for err in errors:
+                st.error(err)
+
+    if fec_parts:
+        fec_all = pd.concat(fec_parts, ignore_index=True)
+
+        # Optional: remove empty lines
+        fec_all = fec_all[(fec_all["PieceRef"].astype(str).str.strip() != "") & (fec_all["CompteNum"].astype(str).str.strip() != "")]
+
+        # Controls
+        by_piece, totals = add_balance_controls(fec_all)
+
+        st.subheader("Contrôle Débit / Crédit (global)")
+        st.write(
+            f"Total Débit = **{totals['TotalDebit']:.2f}** ; "
+            f"Total Crédit = **{totals['TotalCredit']:.2f}** ; "
+            f"Écart = **{totals['TotalEcart']:.2f}**"
         )
 
-        with st.expander("Voir le contenu texte (début)"):
-            st.code("\n".join(fec_text.splitlines()[:30]), language="text")
+        st.subheader("Contrôle Débit / Crédit par pièce (top écarts)")
+        st.dataframe(by_piece.head(50), use_container_width=True)
 
-    except Exception as e:
-        st.error(str(e))
-        st.info(
-            "Astuce : si ton XLS a une mise en page très 'imprimante' (cellules fusionnées, colonnes décalées), "
-            "essaie d’exporter une version plus 'table' (ou de fournir une export balance/journaux)."
-        )
+        st.subheader("Aperçu du FEC (50 premières lignes)")
+        st.dataframe(fec_all[FEC_COLUMNS].head(50), use_container_width=True)
+
+        fec_text = fec_to_text(fec_all[FEC_COLUMNS])
+
+        # filename: single output
+        out_name = "FEC_multi_journaux.txt"
+
+        can_download = True
+        if strict_balance and abs(totals["TotalEcart"]) > 0.0001:
+            can_download = False
+            st.error("Téléchargement bloqué : le FEC global n’est pas équilibré (Débit ≠ Crédit).")
+
+        if can_download:
+            st.download_button(
+                "Télécharger le FEC unique",
+                data=fec_text.encode("utf-8"),
+                file_name=out_name,
+                mime="text/plain"
+            )
+
+        with st.expander("Voir le début du fichier FEC (texte)"):
+            st.code("\n".join(fec_text.splitlines()[:40]), language="text")
 
 else:
-    st.caption("➡️ Charge un fichier pour démarrer.")
+    st.info("Charge un ou plusieurs fichiers Excel pour générer un FEC unique.")
